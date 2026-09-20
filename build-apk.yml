@@ -1,36 +1,142 @@
-name: Build Spacemate APK
+name: Spacemate APK Builder
 
 on:
   workflow_dispatch:
+    inputs:
+      project_url:
+        description: "Public URL of Android project ZIP"
+        required: true
+        type: string
+      artifact_name:
+        description: "APK artifact name"
+        required: true
+        default: "spacemate-app"
+        type: string
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
-  build:
+  build-apk:
+    name: Build Android APK
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx3g"
 
     steps:
-      - name: Checkout project
-        uses: actions/checkout@v4
+      - name: Download Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 "${{ inputs.project_url }}" --output project.zip
+          echo "Downloaded project:"
+          ls -lh project.zip
+          unzip -t project.zip
+          mkdir -p project
+          unzip -q project.zip -d project
+          echo "Project contents:"
+          find project -maxdepth 3 -type f | sort | head -100
 
-      - name: Set up Java
+      - name: Detect Android project root
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT=""
+          if [ -f "project/settings.gradle" ] || [ -f "project/settings.gradle.kts" ]; then
+            ROOT="project"
+          else
+            SETTINGS="$(find project -maxdepth 4 \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
+            if [ -n "$SETTINGS" ]; then
+              ROOT="$(dirname "$SETTINGS")"
+            fi
+          fi
+
+          if [ -z "$ROOT" ]; then
+            echo "::error::No settings.gradle/settings.gradle.kts found in generated ZIP."
+            find project -maxdepth 4 -type f | sort
+            exit 1
+          fi
+
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "Detected Android project root: $ROOT"
+
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Configure Android SDK
+        shell: bash
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > local.properties
+          cat local.properties
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+          cache-disabled: true
 
-      - name: Make Gradle executable
-        run: chmod +x gradlew
+      - name: Validate Gradle project
+        shell: bash
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          set -euo pipefail
+          gradle --version
+          gradle tasks --all
 
       - name: Build APK
-        run: ./gradlew assembleDebug
+        shell: bash
+        working-directory: ${{ steps.detect.outputs.root }}
+        run: |
+          set -o pipefail
+          gradle --no-daemon --stacktrace --info assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
+
+      - name: Find generated APK
+        id: apk
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find "${{ steps.detect.outputs.root }}" -type f -path "*/build/outputs/apk/*/*.apk" -print -quit)"
+          if [ -z "$APK" ]; then
+            echo "::error::Gradle completed but no APK was found."
+            find "${{ steps.detect.outputs.root }}" -type f | sort | tail -200
+            exit 1
+          fi
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "APK generated: $APK"
+          ls -lh "$APK"
 
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: spacemate-apk
-          path: app/build/outputs/apk/debug/*.apk
+          name: ${{ inputs.artifact_name }}
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log if build fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spacemate-gradle-build-log
+          path: gradle-build.log
+          if-no-files-found: ignore
+          retention-days: 7

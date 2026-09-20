@@ -18,54 +18,37 @@ permissions:
   actions: read
 
 jobs:
-  build-apk:
-    name: Build Android APK
-    runs-on: ubuntu-latest
+  build:
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
-    env:
-      GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx3g"
-
     steps:
-      - name: Download Android project
+      - name: Download project
         shell: bash
         run: |
-          set -euo pipefail
-          curl --fail --location --retry 3 "${{ inputs.project_url }}" --output project.zip
-          echo "Downloaded project:"
-          ls -lh project.zip
+          set -euxo pipefail
+          curl -fL --retry 3 "${{ inputs.project_url }}" -o project.zip
           unzip -t project.zip
           mkdir -p project
           unzip -q project.zip -d project
-          echo "Project contents:"
-          find project -maxdepth 3 -type f | sort | head -100
+          find project -maxdepth 4 -type f | sort | head -200
 
-      - name: Detect Android project root
-        id: detect
+      - name: Detect project root
+        id: root
         shell: bash
         run: |
-          set -euo pipefail
-          ROOT=""
-          if [ -f "project/settings.gradle" ] || [ -f "project/settings.gradle.kts" ]; then
-            ROOT="project"
-          else
-            SETTINGS="$(find project -maxdepth 4 \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
-            if [ -n "$SETTINGS" ]; then
-              ROOT="$(dirname "$SETTINGS")"
-            fi
-          fi
-
-          if [ -z "$ROOT" ]; then
-            echo "::error::No settings.gradle/settings.gradle.kts found in generated ZIP."
-            find project -maxdepth 4 -type f | sort
+          set -euxo pipefail
+          SETTINGS="$(find project -maxdepth 5 -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit)"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::Android settings.gradle/settings.gradle.kts not found."
             exit 1
           fi
+          ROOT="$(dirname "$SETTINGS")"
+          echo "dir=$ROOT" >> "$GITHUB_OUTPUT"
+          echo "Android project root: $ROOT"
 
-          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
-          echo "Detected Android project root: $ROOT"
-
-      - name: Set up Java 17
-        uses: actions/setup-java@v4
+      - name: Set up Java
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -73,58 +56,51 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK packages
+      - name: Install Android packages
         shell: bash
         run: |
+          set -euxo pipefail
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Configure Android SDK
         shell: bash
-        working-directory: ${{ steps.detect.outputs.root }}
+        working-directory: ${{ steps.root.outputs.dir }}
         run: |
-          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > local.properties
-          cat local.properties
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.7"
-          cache-disabled: true
-
-      - name: Validate Gradle project
-        shell: bash
-        working-directory: ${{ steps.detect.outputs.root }}
-        run: |
-          set -euo pipefail
-          gradle --version
-          gradle tasks --all
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
 
       - name: Build APK
+        id: gradle
         shell: bash
-        working-directory: ${{ steps.detect.outputs.root }}
+        working-directory: ${{ steps.root.outputs.dir }}
         run: |
           set -o pipefail
-          gradle --no-daemon --stacktrace --info assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
 
-      - name: Find generated APK
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew --no-daemon --stacktrace assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
+          else
+            echo "Gradle wrapper not found; installing Gradle 8.7."
+            wget -q https://services.gradle.org/distributions/gradle-8.7-bin.zip -O /tmp/gradle.zip
+            unzip -q /tmp/gradle.zip -d /opt
+            /opt/gradle-8.7/bin/gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
+          fi
+
+      - name: Locate APK
         id: apk
-        if: success()
         shell: bash
         run: |
-          set -euo pipefail
-          APK="$(find "${{ steps.detect.outputs.root }}" -type f -path "*/build/outputs/apk/*/*.apk" -print -quit)"
+          set -euxo pipefail
+          APK="$(find "${{ steps.root.outputs.dir }}" -type f -name "*.apk" -path "*/build/outputs/apk/*" -print -quit)"
           if [ -z "$APK" ]; then
-            echo "::error::Gradle completed but no APK was found."
-            find "${{ steps.detect.outputs.root }}" -type f | sort | tail -200
+            echo "::error::Build completed but no APK file was found."
+            find "${{ steps.root.outputs.dir }}" -type f -path "*/build/outputs/*" -print || true
             exit 1
           fi
           echo "path=$APK" >> "$GITHUB_OUTPUT"
-          echo "APK generated: $APK"
           ls -lh "$APK"
 
       - name: Upload APK
-        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact_name }}
@@ -132,11 +108,11 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload build log if build fails
+      - name: Upload failure log
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: spacemate-gradle-build-log
+          name: spacemate-build-error-log
           path: gradle-build.log
           if-no-files-found: ignore
           retention-days: 7
